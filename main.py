@@ -1,31 +1,35 @@
+import io
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 
-# ---------------------------------------------------------
-# 페이지 기본 설정
-# ---------------------------------------------------------
+# =========================================================
+# 기본 설정
+# =========================================================
 st.set_page_config(
-    page_title="지역별 인구 구조 분석",
+    page_title="전국 인구구조 유사 지역 찾기",
     page_icon="📊",
     layout="wide",
 )
 
+DEFAULT_CSV_FILE = "202606_202606.csv"
 
-# ---------------------------------------------------------
-# 디자인
-# ---------------------------------------------------------
+
+# =========================================================
+# 화면 디자인
+# =========================================================
 st.markdown(
     """
     <style>
         .block-container {
-            max-width: 1400px;
+            max-width: 1450px;
             padding-top: 2rem;
-            padding-bottom: 3rem;
+            padding-bottom: 4rem;
         }
 
         .main-title {
@@ -51,249 +55,472 @@ st.markdown(
 )
 
 
-# ---------------------------------------------------------
-# 상수
-# ---------------------------------------------------------
-DEFAULT_DATA_FILE = "202606_202606.csv"
-
-
-# ---------------------------------------------------------
-# 데이터 관련 함수
-# ---------------------------------------------------------
+# =========================================================
+# 데이터 불러오기
+# =========================================================
 @st.cache_data
-def load_csv(file_source):
+def load_csv_from_bytes(file_bytes):
     """
-    CSV 파일의 인코딩을 자동으로 확인해 불러옵니다.
+    여러 인코딩을 순서대로 시도하여 CSV를 불러옵니다.
     """
     encodings = ["cp949", "euc-kr", "utf-8-sig", "utf-8"]
-
     last_error = None
 
     for encoding in encodings:
         try:
-            df = pd.read_csv(
-                file_source,
+            dataframe = pd.read_csv(
+                io.BytesIO(file_bytes),
                 encoding=encoding,
                 dtype=str,
                 low_memory=False,
             )
 
-            df.columns = df.columns.astype(str).str.strip()
+            dataframe.columns = (
+                dataframe.columns
+                .astype(str)
+                .str.replace("\u3000", " ", regex=False)
+                .str.strip()
+            )
 
-            return df, encoding
+            return dataframe, encoding
 
         except Exception as error:
             last_error = error
-
-            # 업로드 파일은 인코딩 재시도 전에 처음 위치로 되돌립니다.
-            if hasattr(file_source, "seek"):
-                file_source.seek(0)
 
     raise ValueError(
         f"CSV 파일을 읽을 수 없습니다. 마지막 오류: {last_error}"
     )
 
 
-def clean_number(value):
-    """
-    '9,289,813'처럼 쉼표가 포함된 문자열을 숫자로 변환합니다.
-    """
-    if pd.isna(value):
-        return 0
-
-    text = str(value).strip()
-    text = text.replace(",", "")
-    text = text.replace(" ", "")
-
-    return pd.to_numeric(text, errors="coerce")
-
-
 def remove_region_code(region_name):
     """
-    지역명 뒤의 행정구역 코드를 제거합니다.
+    지역명 끝에 붙은 행정구역 코드를 제거합니다.
 
     예:
     서울특별시 종로구 (1111000000)
-    -> 서울특별시 종로구
+    → 서울특별시 종로구
     """
-    return re.sub(r"\s*\(\d+\)\s*$", "", str(region_name)).strip()
+    region_name = str(region_name).strip()
+
+    return re.sub(
+        r"\s*\(\d+\)\s*$",
+        "",
+        region_name,
+    ).strip()
 
 
-def find_column(df, gender, item):
+def extract_region_code(region_name):
     """
-    데이터의 연월이 달라져도 열을 자동으로 찾습니다.
-
-    gender:
-        계, 남, 여
-
-    item:
-        총인구수, 0세, 1세, ..., 100세 이상
+    지역명에서 행정구역 코드를 추출합니다.
     """
-    ending = f"_{gender}_{item}"
+    match = re.search(r"\((\d+)\)\s*$", str(region_name))
+
+    if match:
+        return match.group(1)
+
+    return ""
+
+
+def find_column(dataframe, gender, item):
+    """
+    연월이 포함된 실제 열 이름을 자동으로 찾습니다.
+
+    예:
+    2026년06월_계_0세
+    2026년06월_계_총인구수
+    """
+    target_suffix = f"_{gender}_{item}"
 
     matching_columns = [
         column
-        for column in df.columns
-        if str(column).strip().endswith(ending)
+        for column in dataframe.columns
+        if str(column).strip().endswith(target_suffix)
     ]
 
-    if not matching_columns:
-        return None
+    if matching_columns:
+        return matching_columns[0]
 
-    return matching_columns[0]
+    return None
 
 
-def extract_reference_month(df):
+def extract_reference_month(dataframe):
     """
     열 이름에서 기준 연월을 추출합니다.
-
-    예:
-    2026년06월_계_총인구수
-    -> 2026년 06월
     """
-    for column in df.columns:
-        match = re.search(r"(\d{4})년(\d{2})월", str(column))
+    for column in dataframe.columns:
+        match = re.search(
+            r"(\d{4})년\s*(\d{1,2})월",
+            str(column),
+        )
 
         if match:
             year = match.group(1)
-            month = match.group(2)
-            return f"{year}년 {month}월"
+            month = int(match.group(2))
+
+            return f"{year}년 {month:02d}월"
 
     return "기준 연월 미상"
 
 
-def prepare_data(df):
+def convert_numeric_series(series):
     """
-    지역명과 숫자형 인구 열을 정리합니다.
+    쉼표가 포함된 인구 문자열을 숫자로 변환합니다.
     """
-    region_column = "행정구역"
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    ).fillna(0)
 
-    if region_column not in df.columns:
-        region_column = df.columns[0]
 
-    df = df.copy()
+# =========================================================
+# 인구구조 분석용 데이터 생성
+# =========================================================
+@st.cache_data
+def prepare_population_data(raw_dataframe):
+    dataframe = raw_dataframe.copy()
 
-    df[region_column] = (
-        df[region_column]
+    if "행정구역" in dataframe.columns:
+        region_column = "행정구역"
+    else:
+        region_column = dataframe.columns[0]
+
+    dataframe[region_column] = (
+        dataframe[region_column]
         .astype(str)
         .str.replace("\u3000", " ", regex=False)
         .str.strip()
     )
 
-    df["지역명"] = df[region_column].apply(remove_region_code)
+    dataframe["지역명"] = dataframe[region_column].apply(
+        remove_region_code
+    )
 
-    return df, region_column
+    dataframe["행정구역코드"] = dataframe[region_column].apply(
+        extract_region_code
+    )
 
+    age_labels = [
+        f"{age}세"
+        for age in range(100)
+    ] + ["100세 이상"]
 
-def get_age_population(row, df, gender):
-    """
-    선택한 지역의 0세~100세 이상 인구를 가져옵니다.
-    """
-    records = []
+    age_columns = []
 
-    for age in range(101):
-        age_label = f"{age}세" if age < 100 else "100세 이상"
-        column = find_column(df, gender, age_label)
+    for age_label in age_labels:
+        column = find_column(
+            dataframe,
+            gender="계",
+            item=age_label,
+        )
 
         if column is None:
-            population = 0
-        else:
-            population = clean_number(row[column])
+            raise ValueError(
+                f"'{age_label}'에 해당하는 전체 인구 열을 찾지 못했습니다."
+            )
 
-        if pd.isna(population):
-            population = 0
+        age_columns.append(column)
 
-        records.append(
-            {
-                "나이": age_label,
-                "나이값": age,
-                "인구수": int(population),
-                "구분": gender,
-            }
+    # 연령별 인구수를 숫자로 변환
+    age_population = pd.DataFrame(
+        {
+            age_label: convert_numeric_series(dataframe[column])
+            for age_label, column in zip(age_labels, age_columns)
+        }
+    )
+
+    # 총인구 열
+    total_population_column = find_column(
+        dataframe,
+        gender="계",
+        item="총인구수",
+    )
+
+    if total_population_column is not None:
+        total_population = convert_numeric_series(
+            dataframe[total_population_column]
         )
+    else:
+        total_population = age_population.sum(axis=1)
 
-    return pd.DataFrame(records)
+    # 연령별 인구 합계
+    age_population_sum = age_population.sum(axis=1)
+
+    # 연령별 구성비
+    age_distribution = age_population.div(
+        age_population_sum.replace(0, np.nan),
+        axis=0,
+    ).fillna(0)
+
+    # 코사인 유사도 계산을 위한 L2 정규화
+    distribution_array = age_distribution.to_numpy(
+        dtype=np.float64
+    )
+
+    vector_norms = np.linalg.norm(
+        distribution_array,
+        axis=1,
+        keepdims=True,
+    )
+
+    normalized_vectors = np.divide(
+        distribution_array,
+        vector_norms,
+        out=np.zeros_like(distribution_array),
+        where=vector_norms != 0,
+    )
+
+    metadata = pd.DataFrame(
+        {
+            "지역명": dataframe["지역명"],
+            "원본지역명": dataframe[region_column],
+            "행정구역코드": dataframe["행정구역코드"],
+            "총인구수": total_population.astype(int),
+        }
+    )
+
+    return (
+        metadata,
+        age_population,
+        age_distribution,
+        normalized_vectors,
+        age_labels,
+    )
 
 
-def calculate_age_group(age_df, start_age, end_age):
+def is_eup_myeon_dong(region_name):
     """
-    특정 연령 구간의 인구 합계를 계산합니다.
+    지역명이 읍·면·동에 해당하는지 대략적으로 판별합니다.
     """
-    mask = age_df["나이값"].between(start_age, end_age)
-    return int(age_df.loc[mask, "인구수"].sum())
+    region_name = str(region_name).strip()
+
+    patterns = [
+        r"읍$",
+        r"면$",
+        r"동$",
+        r"\d가동$",
+        r"출장소$",
+    ]
+
+    return any(
+        re.search(pattern, region_name)
+        for pattern in patterns
+    )
 
 
-def make_line_chart(chart_df, selected_region, display_mode):
+def calculate_similar_regions(
+    selected_index,
+    metadata,
+    normalized_vectors,
+    comparison_scope,
+    minimum_population,
+    top_n=5,
+):
     """
-    Plotly 꺾은선 그래프를 생성합니다.
+    선택 지역과 전국 지역 간 코사인 유사도를 계산합니다.
     """
+    selected_vector = normalized_vectors[selected_index]
+
+    similarities = normalized_vectors @ selected_vector
+
+    result = metadata.copy()
+    result["원본인덱스"] = np.arange(len(metadata))
+    result["유사도"] = similarities
+    result["유사도점수"] = similarities * 100
+
+    # 자기 자신 제외
+    result = result[
+        result["원본인덱스"] != selected_index
+    ]
+
+    # 인구가 없는 지역 제외
+    result = result[
+        result["총인구수"] >= minimum_population
+    ]
+
+    if comparison_scope == "읍면동만 비교":
+        result = result[
+            result["지역명"].apply(is_eup_myeon_dong)
+        ]
+
+    result = result.sort_values(
+        by=["유사도", "총인구수"],
+        ascending=[False, False],
+    )
+
+    return result.head(top_n).reset_index(drop=True)
+
+
+# =========================================================
+# Plotly 그래프
+# =========================================================
+def create_similarity_bar_chart(
+    similar_regions,
+    selected_region,
+):
+    chart_data = similar_regions.copy()
+
+    chart_data = chart_data.sort_values(
+        "유사도점수",
+        ascending=True,
+    )
+
     figure = go.Figure()
 
-    line_settings = {
-        "계": {
-            "name": "전체",
-            "color": "#3B82F6",
-            "width": 4,
-        },
-        "남": {
-            "name": "남성",
-            "color": "#22A6F2",
-            "width": 3,
-        },
-        "여": {
-            "name": "여성",
-            "color": "#F06292",
-            "width": 3,
-        },
-    }
-
-    for gender in chart_df["구분"].unique():
-        gender_df = chart_df[chart_df["구분"] == gender]
-
-        settings = line_settings.get(
-            gender,
-            {
-                "name": gender,
-                "color": "#6366F1",
-                "width": 3,
-            },
+    figure.add_trace(
+        go.Bar(
+            x=chart_data["유사도점수"],
+            y=chart_data["지역명"],
+            orientation="h",
+            text=chart_data["유사도점수"].map(
+                lambda value: f"{value:.2f}%"
+            ),
+            textposition="outside",
+            customdata=np.column_stack(
+                [
+                    chart_data["총인구수"],
+                    chart_data["유사도점수"],
+                ]
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "유사도: %{customdata[1]:.2f}%<br>"
+                "총인구: %{customdata[0]:,.0f}명"
+                "<extra></extra>"
+            ),
+            marker=dict(
+                color=chart_data["유사도점수"],
+                colorscale="Blues",
+                showscale=False,
+            ),
         )
+    )
 
-        figure.add_trace(
-            go.Scatter(
-                x=gender_df["나이값"],
-                y=gender_df["표시값"],
-                mode="lines",
-                name=settings["name"],
-                line=dict(
-                    color=settings["color"],
-                    width=settings["width"],
-                ),
-                hovertemplate=(
-                    "<b>%{fullData.name}</b><br>"
-                    "나이: %{x}세<br>"
-                    + (
-                        "비율: %{y:.2f}%"
-                        if display_mode == "비율"
-                        else "인구: %{y:,.0f}명"
-                    )
-                    + "<extra></extra>"
-                ),
-            )
-        )
+    minimum_score = chart_data["유사도점수"].min()
 
-    y_axis_title = (
-        "전체 인구 대비 비율 (%)"
-        if display_mode == "비율"
-        else "인구수 (명)"
+    x_axis_minimum = max(
+        0,
+        minimum_score - 1,
     )
 
     figure.update_layout(
         title=dict(
-            text=f"{selected_region} 연령별 인구 구조",
-            x=0.02,
+            text=f"{selected_region}과 인구구조가 비슷한 지역 Top 5",
+            x=0.01,
             xanchor="left",
-            font=dict(size=22),
+        ),
+        xaxis=dict(
+            title="인구구조 유사도 점수",
+            range=[x_axis_minimum, 100.3],
+            ticksuffix="%",
+            showgrid=True,
+            gridcolor="rgba(128, 128, 128, 0.15)",
+        ),
+        yaxis=dict(
+            title="",
+            automargin=True,
+        ),
+        height=440,
+        margin=dict(
+            l=30,
+            r=70,
+            t=70,
+            b=40,
+        ),
+        template="plotly_white",
+    )
+
+    return figure
+
+
+def create_population_structure_chart(
+    selected_index,
+    selected_region,
+    similar_regions,
+    age_distribution,
+):
+    figure = go.Figure()
+
+    age_values = list(range(101))
+
+    selected_distribution = (
+        age_distribution
+        .iloc[selected_index]
+        .to_numpy(dtype=float)
+        * 100
+    )
+
+    # 선택 지역
+    figure.add_trace(
+        go.Scatter(
+            x=age_values,
+            y=selected_distribution,
+            mode="lines",
+            name=f"선택 지역: {selected_region}",
+            line=dict(
+                width=5,
+                color="#111827",
+            ),
+            hovertemplate=(
+                "<b>선택 지역</b><br>"
+                "나이: %{x}세<br>"
+                "구성비: %{y:.3f}%"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    comparison_colors = [
+        "#2563EB",
+        "#DC2626",
+        "#059669",
+        "#D97706",
+        "#7C3AED",
+    ]
+
+    for rank, row in similar_regions.iterrows():
+        comparison_index = int(row["원본인덱스"])
+
+        comparison_distribution = (
+            age_distribution
+            .iloc[comparison_index]
+            .to_numpy(dtype=float)
+            * 100
+        )
+
+        figure.add_trace(
+            go.Scatter(
+                x=age_values,
+                y=comparison_distribution,
+                mode="lines",
+                name=(
+                    f"{rank + 1}위 {row['지역명']} "
+                    f"({row['유사도점수']:.2f}%)"
+                ),
+                line=dict(
+                    width=2.5,
+                    color=comparison_colors[
+                        rank % len(comparison_colors)
+                    ],
+                ),
+                opacity=0.85,
+                hovertemplate=(
+                    f"<b>{rank + 1}위 "
+                    f"{row['지역명']}</b><br>"
+                    "나이: %{x}세<br>"
+                    "구성비: %{y:.3f}%"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    figure.update_layout(
+        title=dict(
+            text="연령별 인구 구성비 비교",
+            x=0.01,
+            xanchor="left",
         ),
         xaxis=dict(
             title="나이",
@@ -305,8 +532,8 @@ def make_line_chart(chart_df, selected_region, display_mode):
             gridcolor="rgba(128, 128, 128, 0.15)",
         ),
         yaxis=dict(
-            title=y_axis_title,
-            tickformat=".2f" if display_mode == "비율" else ",",
+            title="해당 지역 전체 인구 중 비율",
+            ticksuffix="%",
             rangemode="tozero",
             showgrid=True,
             gridcolor="rgba(128, 128, 128, 0.15)",
@@ -316,339 +543,501 @@ def make_line_chart(chart_df, selected_region, display_mode):
             orientation="h",
             yanchor="bottom",
             y=1.02,
-            xanchor="right",
-            x=1,
+            xanchor="left",
+            x=0,
         ),
-        margin=dict(l=30, r=30, t=100, b=30),
-        height=590,
+        height=650,
+        margin=dict(
+            l=30,
+            r=30,
+            t=130,
+            b=40,
+        ),
         template="plotly_white",
     )
 
     return figure
 
 
-# ---------------------------------------------------------
+def create_population_count_chart(
+    selected_index,
+    selected_region,
+    similar_regions,
+    age_population,
+):
+    """
+    실제 인구수 비교 그래프입니다.
+    지역 규모 차이를 함께 확인할 때 사용합니다.
+    """
+    figure = go.Figure()
+
+    age_values = list(range(101))
+
+    selected_population = (
+        age_population
+        .iloc[selected_index]
+        .to_numpy(dtype=float)
+    )
+
+    figure.add_trace(
+        go.Scatter(
+            x=age_values,
+            y=selected_population,
+            mode="lines",
+            name=f"선택 지역: {selected_region}",
+            line=dict(
+                width=5,
+                color="#111827",
+            ),
+            hovertemplate=(
+                "<b>선택 지역</b><br>"
+                "나이: %{x}세<br>"
+                "인구: %{y:,.0f}명"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    comparison_colors = [
+        "#2563EB",
+        "#DC2626",
+        "#059669",
+        "#D97706",
+        "#7C3AED",
+    ]
+
+    for rank, row in similar_regions.iterrows():
+        comparison_index = int(row["원본인덱스"])
+
+        comparison_population = (
+            age_population
+            .iloc[comparison_index]
+            .to_numpy(dtype=float)
+        )
+
+        figure.add_trace(
+            go.Scatter(
+                x=age_values,
+                y=comparison_population,
+                mode="lines",
+                name=f"{rank + 1}위 {row['지역명']}",
+                line=dict(
+                    width=2.5,
+                    color=comparison_colors[
+                        rank % len(comparison_colors)
+                    ],
+                ),
+                opacity=0.85,
+                hovertemplate=(
+                    f"<b>{rank + 1}위 "
+                    f"{row['지역명']}</b><br>"
+                    "나이: %{x}세<br>"
+                    "인구: %{y:,.0f}명"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    figure.update_layout(
+        title=dict(
+            text="연령별 실제 인구수 비교",
+            x=0.01,
+            xanchor="left",
+        ),
+        xaxis=dict(
+            title="나이",
+            tickmode="linear",
+            tick0=0,
+            dtick=10,
+            range=[0, 100],
+            showgrid=True,
+            gridcolor="rgba(128, 128, 128, 0.15)",
+        ),
+        yaxis=dict(
+            title="인구수",
+            tickformat=",",
+            rangemode="tozero",
+            showgrid=True,
+            gridcolor="rgba(128, 128, 128, 0.15)",
+        ),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
+        height=650,
+        margin=dict(
+            l=30,
+            r=30,
+            t=130,
+            b=40,
+        ),
+        template="plotly_white",
+    )
+
+    return figure
+
+
+# =========================================================
 # 제목
-# ---------------------------------------------------------
+# =========================================================
 st.markdown(
-    '<div class="main-title">📊 지역별 인구 구조 분석</div>',
+    '<div class="main-title">'
+    "📊 전국 인구구조 유사 지역 찾기"
+    "</div>",
     unsafe_allow_html=True,
 )
 
 st.markdown(
     '<div class="sub-title">'
-    "지역을 검색하거나 목록에서 선택해 연령별 인구 구조를 확인하세요."
+    "선택한 지역과 연령별 인구구조가 가장 비슷한 "
+    "전국 지역 Top 5를 찾아 비교합니다."
     "</div>",
     unsafe_allow_html=True,
 )
 
 
-# ---------------------------------------------------------
-# 데이터 불러오기
-# ---------------------------------------------------------
-default_file_path = Path(DEFAULT_DATA_FILE)
-
+# =========================================================
+# 파일 선택
+# =========================================================
 with st.sidebar:
     st.header("⚙️ 데이터 설정")
 
     uploaded_file = st.file_uploader(
-        "다른 CSV 파일 사용",
+        "다른 주민등록 인구 CSV 사용",
         type=["csv"],
         help=(
-            "파일을 업로드하지 않으면 GitHub 저장소의 "
-            f"{DEFAULT_DATA_FILE} 파일을 사용합니다."
+            "파일을 업로드하지 않으면 저장소의 "
+            f"{DEFAULT_CSV_FILE} 파일을 사용합니다."
         ),
-    )
-
-    st.caption(
-        "업로드한 파일은 현재 실행 중인 세션에서만 사용됩니다."
     )
 
 
 try:
     if uploaded_file is not None:
-        raw_df, detected_encoding = load_csv(uploaded_file)
+        file_bytes = uploaded_file.getvalue()
         data_source_name = uploaded_file.name
 
-    elif default_file_path.exists():
-        raw_df, detected_encoding = load_csv(default_file_path)
-        data_source_name = DEFAULT_DATA_FILE
-
     else:
-        st.error(
-            f"`{DEFAULT_DATA_FILE}` 파일을 찾을 수 없습니다."
-        )
+        default_path = Path(DEFAULT_CSV_FILE)
 
-        st.info(
-            "GitHub 저장소에 CSV 파일을 추가하거나 "
-            "왼쪽 메뉴에서 CSV 파일을 업로드하세요."
-        )
+        if not default_path.exists():
+            st.error(
+                f"`{DEFAULT_CSV_FILE}` 파일을 찾을 수 없습니다."
+            )
 
-        st.stop()
+            st.info(
+                "CSV 파일을 main.py와 같은 위치에 올리거나 "
+                "왼쪽 메뉴에서 직접 업로드하세요."
+            )
+
+            st.stop()
+
+        file_bytes = default_path.read_bytes()
+        data_source_name = DEFAULT_CSV_FILE
+
+    raw_df, detected_encoding = load_csv_from_bytes(
+        file_bytes
+    )
+
+    (
+        metadata,
+        age_population,
+        age_distribution,
+        normalized_vectors,
+        age_labels,
+    ) = prepare_population_data(raw_df)
 
 except Exception as error:
-    st.error("데이터를 불러오는 중 오류가 발생했습니다.")
+    st.error("데이터를 처리하는 중 오류가 발생했습니다.")
     st.exception(error)
     st.stop()
 
 
-df, region_column = prepare_data(raw_df)
-reference_month = extract_reference_month(df)
+reference_month = extract_reference_month(raw_df)
 
 
-# ---------------------------------------------------------
-# 지역 검색 및 선택
-# ---------------------------------------------------------
-st.subheader("1. 지역 선택")
-
-search_keyword = st.text_input(
-    "지역 검색",
-    placeholder="예: 서울특별시, 종로구, 청운효자동",
-    help="지역명의 일부만 입력해도 검색됩니다.",
-)
-
-all_regions = (
-    df["지역명"]
-    .dropna()
-    .astype(str)
-    .drop_duplicates()
-    .tolist()
-)
-
-if search_keyword.strip():
-    keyword = search_keyword.strip()
-
-    filtered_regions = [
-        region
-        for region in all_regions
-        if keyword.lower() in region.lower()
-    ]
-
-else:
-    filtered_regions = all_regions
-
-
-if not filtered_regions:
-    st.warning(
-        f"'{search_keyword}'와 일치하는 지역이 없습니다. "
-        "검색어를 더 짧게 입력해 보세요."
-    )
-    st.stop()
-
-
-selected_region = st.selectbox(
-    "검색 결과에서 지역 선택",
-    options=filtered_regions,
-    index=0,
-    help=(
-        "위 검색창에 지역을 입력한 뒤 "
-        "이 목록에서 정확한 지역을 선택하세요."
-    ),
-)
-
-
-selected_rows = df[df["지역명"] == selected_region]
-
-if selected_rows.empty:
-    st.error("선택한 지역의 데이터를 찾지 못했습니다.")
-    st.stop()
-
-selected_row = selected_rows.iloc[0]
-
-
-# ---------------------------------------------------------
-# 표시 옵션
-# ---------------------------------------------------------
+# =========================================================
+# 사이드바 분석 설정
+# =========================================================
 with st.sidebar:
     st.divider()
-    st.subheader("📈 그래프 설정")
+    st.subheader("🔍 유사 지역 설정")
 
-    gender_option = st.radio(
-        "표시할 인구",
+    comparison_scope = st.radio(
+        "비교 대상",
         options=[
-            "전체",
-            "남성",
-            "여성",
-            "남녀 비교",
-            "전체·남성·여성",
+            "모든 행정구역",
+            "읍면동만 비교",
         ],
-        index=4,
-    )
-
-    display_mode = st.radio(
-        "표시 단위",
-        options=["인구수", "비율"],
-        horizontal=True,
-    )
-
-    smoothing_window = st.slider(
-        "이동평균",
-        min_value=1,
-        max_value=10,
-        value=1,
+        index=0,
         help=(
-            "1은 원본 데이터입니다. 값을 높이면 "
-            "연령별 변화가 부드럽게 표시됩니다."
+            "모든 행정구역을 선택하면 시도, 시군구, "
+            "읍면동이 모두 비교 대상에 포함됩니다."
+        ),
+    )
+
+    minimum_population = st.number_input(
+        "비교 지역 최소 인구",
+        min_value=0,
+        max_value=1_000_000,
+        value=1000,
+        step=1000,
+        help=(
+            "인구가 매우 적은 지역은 연령별 구성비가 "
+            "불안정할 수 있습니다."
+        ),
+    )
+
+    chart_mode = st.radio(
+        "비교 그래프 단위",
+        options=[
+            "인구 구성비",
+            "실제 인구수",
+        ],
+        index=0,
+        help=(
+            "유사도는 그래프 선택과 관계없이 "
+            "연령별 인구 구성비로 계산됩니다."
         ),
     )
 
     st.divider()
-    st.caption(f"데이터 파일: {data_source_name}")
+    st.caption(f"파일: {data_source_name}")
     st.caption(f"기준: {reference_month}")
     st.caption(f"인코딩: {detected_encoding}")
-    st.caption(f"지역 수: {len(df):,}개")
+    st.caption(f"전체 행정구역: {len(metadata):,}개")
 
 
-# ---------------------------------------------------------
-# 선택 지역 데이터 만들기
-# ---------------------------------------------------------
-total_df = get_age_population(selected_row, df, "계")
-male_df = get_age_population(selected_row, df, "남")
-female_df = get_age_population(selected_row, df, "여")
+# =========================================================
+# 지역 검색 및 선택
+# =========================================================
+st.subheader("1. 분석할 지역 선택")
 
-gender_map = {
-    "전체": ["계"],
-    "남성": ["남"],
-    "여성": ["여"],
-    "남녀 비교": ["남", "여"],
-    "전체·남성·여성": ["계", "남", "여"],
-}
-
-selected_genders = gender_map[gender_option]
-
-population_frames = {
-    "계": total_df,
-    "남": male_df,
-    "여": female_df,
-}
-
-chart_frames = []
-
-for gender in selected_genders:
-    current_df = population_frames[gender].copy()
-
-    if smoothing_window > 1:
-        current_df["인구수"] = (
-            current_df["인구수"]
-            .rolling(
-                window=smoothing_window,
-                center=True,
-                min_periods=1,
-            )
-            .mean()
-        )
-
-    if display_mode == "비율":
-        gender_total = current_df["인구수"].sum()
-
-        if gender_total > 0:
-            current_df["표시값"] = (
-                current_df["인구수"] / gender_total * 100
-            )
-        else:
-            current_df["표시값"] = 0
-
-    else:
-        current_df["표시값"] = current_df["인구수"]
-
-    chart_frames.append(current_df)
-
-
-chart_df = pd.concat(chart_frames, ignore_index=True)
-
-
-# ---------------------------------------------------------
-# 핵심 지표
-# ---------------------------------------------------------
-total_population_column = find_column(df, "계", "총인구수")
-male_population_column = find_column(df, "남", "총인구수")
-female_population_column = find_column(df, "여", "총인구수")
-
-total_population = (
-    int(clean_number(selected_row[total_population_column]))
-    if total_population_column
-    else int(total_df["인구수"].sum())
+search_keyword = st.text_input(
+    "지역명 검색",
+    placeholder="예: 서울특별시, 수원시, 청운효자동",
+    help="지역명의 일부를 입력할 수 있습니다.",
 )
 
-male_population = (
-    int(clean_number(selected_row[male_population_column]))
-    if male_population_column
-    else int(male_df["인구수"].sum())
+if search_keyword.strip():
+    search_mask = metadata["지역명"].str.contains(
+        search_keyword.strip(),
+        case=False,
+        na=False,
+        regex=False,
+    )
+
+    filtered_metadata = metadata[search_mask].copy()
+
+else:
+    filtered_metadata = metadata.copy()
+
+
+if filtered_metadata.empty:
+    st.warning(
+        f"'{search_keyword}'에 해당하는 지역을 찾지 못했습니다."
+    )
+    st.stop()
+
+
+region_options = filtered_metadata.index.tolist()
+
+selected_index = st.selectbox(
+    "검색 결과에서 정확한 지역 선택",
+    options=region_options,
+    format_func=lambda index: (
+        f"{metadata.loc[index, '지역명']} "
+        f"— {metadata.loc[index, '총인구수']:,}명"
+    ),
 )
 
-female_population = (
-    int(clean_number(selected_row[female_population_column]))
-    if female_population_column
-    else int(female_df["인구수"].sum())
+selected_index = int(selected_index)
+selected_region = metadata.loc[selected_index, "지역명"]
+selected_population = int(
+    metadata.loc[selected_index, "총인구수"]
 )
 
-youth_population = calculate_age_group(total_df, 0, 14)
-working_population = calculate_age_group(total_df, 15, 64)
-senior_population = calculate_age_group(total_df, 65, 100)
 
-largest_age_row = total_df.loc[total_df["인구수"].idxmax()]
-largest_age = largest_age_row["나이"]
-largest_age_population = int(largest_age_row["인구수"])
+# =========================================================
+# 유사 지역 계산
+# =========================================================
+similar_regions = calculate_similar_regions(
+    selected_index=selected_index,
+    metadata=metadata,
+    normalized_vectors=normalized_vectors,
+    comparison_scope=comparison_scope,
+    minimum_population=int(minimum_population),
+    top_n=5,
+)
 
 
-st.subheader("2. 주요 인구 지표")
+if similar_regions.empty:
+    st.warning(
+        "현재 조건에 해당하는 비교 지역이 없습니다. "
+        "최소 인구 기준을 낮추거나 비교 대상을 변경하세요."
+    )
+    st.stop()
+
+
+# =========================================================
+# 선택 지역 핵심 정보
+# =========================================================
+selected_distribution = age_distribution.iloc[
+    selected_index
+]
+
+youth_ratio = (
+    selected_distribution.iloc[0:15].sum() * 100
+)
+
+working_age_ratio = (
+    selected_distribution.iloc[15:65].sum() * 100
+)
+
+senior_ratio = (
+    selected_distribution.iloc[65:101].sum() * 100
+)
+
+largest_age_index = int(
+    age_population
+    .iloc[selected_index]
+    .to_numpy()
+    .argmax()
+)
+
+largest_age_label = (
+    f"{largest_age_index}세"
+    if largest_age_index < 100
+    else "100세 이상"
+)
 
 metric_columns = st.columns(5)
 
 with metric_columns[0]:
     st.metric(
-        "총인구",
-        f"{total_population:,}명",
+        "선택 지역",
+        selected_region,
     )
 
 with metric_columns[1]:
     st.metric(
-        "남성",
-        f"{male_population:,}명",
-        f"{male_population / total_population * 100:.1f}%"
-        if total_population > 0
-        else None,
+        "총인구",
+        f"{selected_population:,}명",
     )
 
 with metric_columns[2]:
     st.metric(
-        "여성",
-        f"{female_population:,}명",
-        f"{female_population / total_population * 100:.1f}%"
-        if total_population > 0
-        else None,
+        "0~14세",
+        f"{youth_ratio:.1f}%",
     )
 
 with metric_columns[3]:
     st.metric(
         "65세 이상",
-        f"{senior_population:,}명",
-        f"{senior_population / total_population * 100:.1f}%"
-        if total_population > 0
-        else None,
+        f"{senior_ratio:.1f}%",
     )
 
 with metric_columns[4]:
     st.metric(
-        "인구가 가장 많은 나이",
-        largest_age,
-        f"{largest_age_population:,}명",
+        "인구 최다 연령",
+        largest_age_label,
     )
 
 
-# ---------------------------------------------------------
-# Plotly 꺾은선 그래프
-# ---------------------------------------------------------
-st.subheader("3. 연령별 인구 구조")
+# =========================================================
+# Top 5 결과 표
+# =========================================================
+st.subheader("2. 인구구조 유사 지역 Top 5")
 
-figure = make_line_chart(
-    chart_df=chart_df,
+result_table = similar_regions[
+    [
+        "지역명",
+        "총인구수",
+        "유사도점수",
+    ]
+].copy()
+
+result_table.insert(
+    0,
+    "순위",
+    range(1, len(result_table) + 1),
+)
+
+result_table["유사도점수"] = (
+    result_table["유사도점수"].round(4)
+)
+
+st.dataframe(
+    result_table,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "순위": st.column_config.NumberColumn(
+            "순위",
+            format="%d위",
+        ),
+        "지역명": st.column_config.TextColumn(
+            "지역",
+        ),
+        "총인구수": st.column_config.NumberColumn(
+            "총인구",
+            format="%d명",
+        ),
+        "유사도점수": st.column_config.ProgressColumn(
+            "인구구조 유사도",
+            min_value=0,
+            max_value=100,
+            format="%.2f%%",
+        ),
+    },
+)
+
+
+# =========================================================
+# 유사도 막대그래프
+# =========================================================
+similarity_bar_chart = create_similarity_bar_chart(
+    similar_regions=similar_regions,
     selected_region=selected_region,
-    display_mode=display_mode,
 )
 
 st.plotly_chart(
-    figure,
+    similarity_bar_chart,
+    use_container_width=True,
+    config={
+        "displaylogo": False,
+    },
+)
+
+
+# =========================================================
+# 연령별 구조 비교 그래프
+# =========================================================
+st.subheader("3. 선택 지역과 Top 5 연령별 비교")
+
+if chart_mode == "인구 구성비":
+    comparison_chart = create_population_structure_chart(
+        selected_index=selected_index,
+        selected_region=selected_region,
+        similar_regions=similar_regions,
+        age_distribution=age_distribution,
+    )
+
+else:
+    comparison_chart = create_population_count_chart(
+        selected_index=selected_index,
+        selected_region=selected_region,
+        similar_regions=similar_regions,
+        age_population=age_population,
+    )
+
+
+st.plotly_chart(
+    comparison_chart,
     use_container_width=True,
     config={
         "displaylogo": False,
@@ -661,89 +1050,61 @@ st.plotly_chart(
 )
 
 
-# ---------------------------------------------------------
-# 연령대별 요약
-# ---------------------------------------------------------
-st.subheader("4. 연령대별 요약")
+# =========================================================
+# 분석 설명
+# =========================================================
+with st.expander("유사도 계산 방법 보기"):
+    st.markdown(
+        """
+        **유사도 계산 과정**
 
-summary_columns = st.columns(3)
+        1. 각 지역의 0세부터 100세 이상까지 인구를 가져옵니다.
+        2. 지역마다 연령별 인구를 해당 지역의 전체 연령 인구로 나눕니다.
+        3. 지역별 연령 구성비를 101개의 숫자로 이루어진 벡터로 만듭니다.
+        4. 선택 지역과 전국 지역의 코사인 유사도를 계산합니다.
+        5. 선택 지역 자체를 제외하고 점수가 높은 5개 지역을 표시합니다.
 
-with summary_columns[0]:
-    st.metric(
-        "유소년 인구",
-        f"{youth_population:,}명",
-        f"0~14세 · {youth_population / total_population * 100:.1f}%"
-        if total_population > 0
-        else "0~14세",
-    )
-
-with summary_columns[1]:
-    st.metric(
-        "생산연령 인구",
-        f"{working_population:,}명",
-        f"15~64세 · {working_population / total_population * 100:.1f}%"
-        if total_population > 0
-        else "15~64세",
-    )
-
-with summary_columns[2]:
-    st.metric(
-        "고령 인구",
-        f"{senior_population:,}명",
-        f"65세 이상 · {senior_population / total_population * 100:.1f}%"
-        if total_population > 0
-        else "65세 이상",
+        유사도 점수가 100%에 가까울수록 연령별 인구구조의 모양이
+        비슷하다는 뜻입니다. 총인구 규모가 비슷하다는 뜻은 아닙니다.
+        """
     )
 
 
-# ---------------------------------------------------------
-# 상세 데이터
-# ---------------------------------------------------------
-with st.expander("연령별 상세 데이터 보기"):
-    detail_df = pd.DataFrame(
-        {
-            "나이": total_df["나이"],
-            "전체": total_df["인구수"],
-            "남성": male_df["인구수"],
-            "여성": female_df["인구수"],
-        }
-    )
+# =========================================================
+# 결과 다운로드
+# =========================================================
+download_table = result_table.copy()
 
-    detail_df["남성 비율(%)"] = (
-        detail_df["남성"] / detail_df["전체"] * 100
-    ).fillna(0).round(2)
+download_table["기준지역"] = selected_region
+download_table["기준지역_총인구"] = selected_population
+download_table["기준연월"] = reference_month
 
-    detail_df["여성 비율(%)"] = (
-        detail_df["여성"] / detail_df["전체"] * 100
-    ).fillna(0).round(2)
+download_table = download_table[
+    [
+        "기준연월",
+        "기준지역",
+        "기준지역_총인구",
+        "순위",
+        "지역명",
+        "총인구수",
+        "유사도점수",
+    ]
+]
 
-    st.dataframe(
-        detail_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "전체": st.column_config.NumberColumn(format="%d명"),
-            "남성": st.column_config.NumberColumn(format="%d명"),
-            "여성": st.column_config.NumberColumn(format="%d명"),
-            "남성 비율(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "여성 비율(%)": st.column_config.NumberColumn(format="%.2f%%"),
-        },
-    )
+download_csv = download_table.to_csv(
+    index=False,
+    encoding="utf-8-sig",
+).encode("utf-8-sig")
 
-    csv_data = detail_df.to_csv(
-        index=False,
-        encoding="utf-8-sig",
-    ).encode("utf-8-sig")
+safe_region_name = re.sub(
+    r'[\\/:*?"<>|]',
+    "_",
+    selected_region,
+)
 
-    safe_region_name = re.sub(
-        r'[\\/:*?"<>|]',
-        "_",
-        selected_region,
-    )
-
-    st.download_button(
-        label="선택 지역 데이터 CSV 다운로드",
-        data=csv_data,
-        file_name=f"{safe_region_name}_인구구조.csv",
-        mime="text/csv",
-    )
+st.download_button(
+    label="Top 5 분석 결과 CSV 다운로드",
+    data=download_csv,
+    file_name=f"{safe_region_name}_유사인구구조_Top5.csv",
+    mime="text/csv",
+)
